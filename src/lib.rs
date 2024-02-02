@@ -1,19 +1,24 @@
+#![feature(type_alias_impl_trait)]
+
+use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::task::{ready, Context, Poll};
 
 use compio_buf::{BufResult, IoBufMut};
-use futures_core::future::LocalBoxFuture;
 use futures_io::AsyncBufRead;
 
-pub struct CompatRead<Io, Buf> {
+type Fut<'a, Io: compio_io::AsyncRead + Unpin + 'a, Buf: IoBufMut + Unpin> =
+    impl Future<Output = (Io, BufResult<usize, Buf>)> + 'a + Unpin;
+
+pub struct CompatRead<'a, Io: compio_io::AsyncRead + Unpin + 'a, Buf: IoBufMut + Unpin> {
     io: Option<Io>,
-    fut: Option<LocalBoxFuture<'static, (Io, BufResult<usize, Buf>)>>,
+    fut: Option<Fut<'a, Io, Buf>>,
     buf: Option<Buf>,
     data_size: usize,
 }
 
-impl<Io, Buf> CompatRead<Io, Buf> {
+impl<'a, Io: compio_io::AsyncRead + Unpin + 'a, Buf: IoBufMut + Unpin> CompatRead<'a, Io, Buf> {
     pub fn new(io: Io, buf: Buf) -> Self {
         Self {
             io: Some(io),
@@ -24,14 +29,14 @@ impl<Io, Buf> CompatRead<Io, Buf> {
     }
 }
 
-impl<Io: compio_io::AsyncRead + Unpin + 'static, Buf: IoBufMut + Unpin> AsyncBufRead
-    for CompatRead<Io, Buf>
+impl<'a, Io: compio_io::AsyncRead + Unpin + 'a, Buf: IoBufMut + Unpin> AsyncBufRead
+    for CompatRead<'a, Io, Buf>
 {
     fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
         let this = self.get_mut();
         loop {
             match this.fut.take() {
-                Some(mut fut) => match fut.as_mut().poll(cx) {
+                Some(mut fut) => match Pin::new(&mut fut).poll(cx) {
                     Poll::Pending => {
                         this.fut = Some(fut);
 
@@ -71,8 +76,8 @@ impl<Io: compio_io::AsyncRead + Unpin + 'static, Buf: IoBufMut + Unpin> AsyncBuf
     }
 }
 
-impl<Io: compio_io::AsyncRead + Unpin + 'static, Buf: IoBufMut + Unpin> futures_io::AsyncRead
-    for CompatRead<Io, Buf>
+impl<'a, Io: compio_io::AsyncRead + Unpin + 'a, Buf: IoBufMut + Unpin> futures_io::AsyncRead
+    for CompatRead<'a, Io, Buf>
 {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -98,16 +103,19 @@ impl<Io: compio_io::AsyncRead + Unpin + 'static, Buf: IoBufMut + Unpin> futures_
 
 #[cfg(test)]
 mod tests {
-    use compio::net::{TcpListener, TcpStream};
+    use std::env;
+
+    use compio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
     use compio::runtime;
     use compio::runtime::Runtime;
     use compio_io::AsyncWriteExt;
     use futures_util::AsyncReadExt;
+    use tempfile::TempDir;
 
     use super::*;
 
     #[test]
-    fn test_read() {
+    fn test_tcp_read() {
         Runtime::new().unwrap().block_on(async {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
@@ -120,6 +128,29 @@ mod tests {
 
             let tcp_stream = TcpStream::connect(addr).await.unwrap();
             let mut compat_read = CompatRead::new(tcp_stream, vec![0; 100]);
+
+            let mut buf = [0; 100];
+            let n = compat_read.read(&mut buf).await.unwrap();
+
+            assert_eq!(&buf[..n], b"test");
+        });
+    }
+
+    #[test]
+    fn test_udp_read() {
+        Runtime::new().unwrap().block_on(async {
+            let dir = TempDir::new_in(env::temp_dir()).unwrap();
+            let path = dir.path().join("test.sock");
+            let unix_listener = UnixListener::bind(&path).unwrap();
+
+            runtime::spawn(async move {
+                let mut unix_stream = unix_listener.accept().await.unwrap().0;
+                unix_stream.write_all(b"test").await.0.unwrap();
+            })
+            .detach();
+
+            let unix_stream = UnixStream::connect(path).unwrap();
+            let mut compat_read = CompatRead::new(unix_stream, vec![0; 100]);
 
             let mut buf = [0; 100];
             let n = compat_read.read(&mut buf).await.unwrap();
