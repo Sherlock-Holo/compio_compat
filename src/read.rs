@@ -33,13 +33,9 @@ impl<'a, Io: compio_io::AsyncRead + Unpin + 'a, Buf: IoBufMut + Unpin> AsyncBufR
     fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
         let this = self.get_mut();
         loop {
-            match this.fut.take() {
-                Some(mut fut) => match Pin::new(&mut fut).poll(cx) {
-                    Poll::Pending => {
-                        this.fut = Some(fut);
-
-                        return Poll::Pending;
-                    }
+            match this.fut.as_mut() {
+                Some(fut) => match Pin::new(fut).poll(cx) {
+                    Poll::Pending => return Poll::Pending,
 
                     Poll::Ready((io, BufResult(res, buf))) => {
                         this.io = Some(io);

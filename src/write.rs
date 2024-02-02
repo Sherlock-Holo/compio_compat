@@ -1,7 +1,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::{io, mem, slice};
+use std::{io, slice};
 
 use compio_buf::{BufResult, IntoInner, IoBuf, IoBufMut};
 use futures_util::task::AtomicWaker;
@@ -32,6 +32,19 @@ pub struct CompatWrite<'a, Io: compio_io::AsyncWrite + Unpin + 'a, Buf: IoBufMut
     buf: Option<Buf>,
 }
 
+impl<'a, Io: compio_io::AsyncWrite + Unpin + 'a, Buf: IoBufMut + Unpin> CompatWrite<'a, Io, Buf> {
+    pub fn new(io: Io, buf: Buf) -> Self {
+        Self {
+            io: Some(io),
+            fut: FutState::Idle,
+            write_waker: Default::default(),
+            flush_waker: Default::default(),
+            close_waker: Default::default(),
+            buf: Some(buf),
+        }
+    }
+}
+
 impl<'a, Io: compio_io::AsyncWrite + Unpin + 'a, Buf: IoBufMut + Unpin> futures_util::AsyncWrite
     for CompatWrite<'a, Io, Buf>
 {
@@ -42,63 +55,57 @@ impl<'a, Io: compio_io::AsyncWrite + Unpin + 'a, Buf: IoBufMut + Unpin> futures_
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
         loop {
-            unsafe {
-                match mem::replace(&mut this.fut, FutState::Idle) {
-                    FutState::Idle => {
-                        let mut io = this.io.take().unwrap();
-                        let buf = this.buf.take().unwrap();
-                        let size = buf.buf_capacity().min(data.len());
-                        let mut buf = buf.slice(..size);
-                        {
-                            // Safety: we don't read it
-                            let buf =
-                                slice::from_raw_parts_mut(buf.as_buf_mut_ptr(), buf.buf_capacity());
-                            buf.copy_from_slice(&data[..size]);
-                        }
-
-                        this.fut = FutState::Write(
-                            async move {
-                                let BufResult(res, buf) = io.write(buf).await;
-
-                                (io, BufResult(res, buf.into_inner()))
-                            }
-                            .boxed_local(),
-                        );
-                    }
-                    FutState::Write(mut fut) => {
-                        return match Pin::new(&mut fut).poll(cx) {
-                            Poll::Pending => {
-                                this.fut = FutState::Write(fut);
-
-                                Poll::Pending
-                            }
-
-                            Poll::Ready((io, BufResult(res, buf))) => {
-                                this.io = Some(io);
-                                this.buf = Some(buf);
-
-                                // wait other pending tasks
-                                this.flush_waker.wake();
-                                this.close_waker.wake();
-
-                                Poll::Ready(res)
-                            }
+            match &mut this.fut {
+                FutState::Idle => {
+                    let mut io = this.io.take().unwrap();
+                    let buf = this.buf.take().unwrap();
+                    let size = buf.buf_capacity().min(data.len());
+                    let mut buf = buf.slice(..size);
+                    {
+                        // Safety: we don't read it
+                        let buf = unsafe {
+                            slice::from_raw_parts_mut(buf.as_buf_mut_ptr(), buf.buf_capacity())
                         };
+                        buf.copy_from_slice(&data[..size]);
                     }
 
-                    FutState::Flush(fut) => {
-                        this.write_waker.register(cx.waker());
-                        this.fut = FutState::Flush(fut);
+                    this.fut = FutState::Write(
+                        async move {
+                            let BufResult(res, buf) = io.write(buf).await;
 
-                        return Poll::Pending;
-                    }
+                            (io, BufResult(res, buf.into_inner()))
+                        }
+                        .boxed_local(),
+                    );
+                }
 
-                    FutState::Close(fut) => {
-                        this.write_waker.register(cx.waker());
-                        this.fut = FutState::Close(fut);
+                FutState::Write(ref mut fut) => {
+                    return match Pin::new(fut).poll(cx) {
+                        Poll::Pending => Poll::Pending,
 
-                        return Poll::Pending;
-                    }
+                        Poll::Ready((io, BufResult(res, buf))) => {
+                            this.io = Some(io);
+                            this.buf = Some(buf);
+
+                            // wait other pending tasks
+                            this.flush_waker.wake();
+                            this.close_waker.wake();
+
+                            Poll::Ready(res)
+                        }
+                    };
+                }
+
+                FutState::Flush(_) => {
+                    this.write_waker.register(cx.waker());
+
+                    return Poll::Pending;
+                }
+
+                FutState::Close(_) => {
+                    this.write_waker.register(cx.waker());
+
+                    return Poll::Pending;
                 }
             }
         }
@@ -107,7 +114,7 @@ impl<'a, Io: compio_io::AsyncWrite + Unpin + 'a, Buf: IoBufMut + Unpin> futures_
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         loop {
-            match mem::replace(&mut this.fut, FutState::Idle) {
+            match &mut this.fut {
                 FutState::Idle => {
                     let mut io = this.io.take().unwrap();
 
@@ -121,20 +128,15 @@ impl<'a, Io: compio_io::AsyncWrite + Unpin + 'a, Buf: IoBufMut + Unpin> futures_
                     );
                 }
 
-                FutState::Write(fut) => {
+                FutState::Write(_) => {
                     this.flush_waker.register(cx.waker());
-                    this.fut = FutState::Write(fut);
 
                     return Poll::Pending;
                 }
 
-                FutState::Flush(mut fut) => {
-                    return match Pin::new(&mut fut).poll(cx) {
-                        Poll::Pending => {
-                            this.fut = FutState::Flush(fut);
-
-                            Poll::Pending
-                        }
+                FutState::Flush(ref mut fut) => {
+                    return match Pin::new(fut).poll(cx) {
+                        Poll::Pending => Poll::Pending,
                         Poll::Ready((io, res)) => {
                             this.io = Some(io);
                             this.write_waker.wake();
@@ -145,9 +147,8 @@ impl<'a, Io: compio_io::AsyncWrite + Unpin + 'a, Buf: IoBufMut + Unpin> futures_
                     }
                 }
 
-                FutState::Close(fut) => {
+                FutState::Close(_) => {
                     this.flush_waker.register(cx.waker());
-                    this.fut = FutState::Close(fut);
 
                     return Poll::Pending;
                 }
@@ -158,7 +159,7 @@ impl<'a, Io: compio_io::AsyncWrite + Unpin + 'a, Buf: IoBufMut + Unpin> futures_
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         loop {
-            match mem::replace(&mut this.fut, FutState::Idle) {
+            match &mut this.fut {
                 FutState::Idle => {
                     let mut io = this.io.take().unwrap();
 
@@ -172,20 +173,15 @@ impl<'a, Io: compio_io::AsyncWrite + Unpin + 'a, Buf: IoBufMut + Unpin> futures_
                     );
                 }
 
-                FutState::Write(fut) => {
+                FutState::Write(_) => {
                     this.close_waker.register(cx.waker());
-                    this.fut = FutState::Write(fut);
 
                     return Poll::Pending;
                 }
 
-                FutState::Close(mut fut) => {
-                    return match Pin::new(&mut fut).poll(cx) {
-                        Poll::Pending => {
-                            this.fut = FutState::Close(fut);
-
-                            Poll::Pending
-                        }
+                FutState::Close(ref mut fut) => {
+                    return match Pin::new(fut).poll(cx) {
+                        Poll::Pending => Poll::Pending,
                         Poll::Ready((io, res)) => {
                             this.io = Some(io);
                             this.write_waker.wake();
@@ -196,9 +192,8 @@ impl<'a, Io: compio_io::AsyncWrite + Unpin + 'a, Buf: IoBufMut + Unpin> futures_
                     }
                 }
 
-                FutState::Flush(fut) => {
+                FutState::Flush(_) => {
                     this.close_waker.register(cx.waker());
-                    this.fut = FutState::Flush(fut);
 
                     return Poll::Pending;
                 }
