@@ -33,6 +33,17 @@ impl<'a, Io: compio_io::AsyncRead + Unpin + 'a, Buf: IoBufMut + Unpin> Unpin
 {
 }
 
+impl<'a, Io: compio_io::AsyncRead + 'a, Buf: IoBufMut> Drop for CompatRead<'a, Io, Buf> {
+    fn drop(&mut self) {
+        if let Some(fut) = self.fut.as_mut() {
+            // safety: we won't use it again
+            unsafe {
+                ManuallyDrop::drop(fut);
+            }
+        }
+    }
+}
+
 impl<'a, Io: compio_io::AsyncRead + 'a, Buf: IoBufMut> AsyncBufRead for CompatRead<'a, Io, Buf> {
     fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
         // safety: we don't move self
@@ -47,10 +58,6 @@ impl<'a, Io: compio_io::AsyncRead + 'a, Buf: IoBufMut> AsyncBufRead for CompatRe
                         this.io = Some(io);
                         this.buf = Some(buf);
 
-                        // safety: we won't use it again
-                        unsafe {
-                            ManuallyDrop::drop(fut);
-                        }
                         this.fut.take();
 
                         let n = res?;
