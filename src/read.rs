@@ -1,6 +1,5 @@
 use std::future::Future;
 use std::io;
-use std::mem::ManuallyDrop;
 use std::pin::Pin;
 use std::task::{ready, Context, Poll};
 
@@ -12,7 +11,7 @@ type Fut<'a, Io: compio_io::AsyncRead + 'a, Buf: IoBufMut> =
 
 pub struct CompatRead<'a, Io: compio_io::AsyncRead + 'a, Buf: IoBufMut> {
     io: Option<Io>,
-    fut: Option<ManuallyDrop<Fut<'a, Io, Buf>>>,
+    fut: Option<Fut<'a, Io, Buf>>,
     buf: Option<Buf>,
     data_size: usize,
 }
@@ -28,22 +27,6 @@ impl<'a, Io: compio_io::AsyncRead + 'a, Buf: IoBufMut> CompatRead<'a, Io, Buf> {
     }
 }
 
-impl<'a, Io: compio_io::AsyncRead + Unpin + 'a, Buf: IoBufMut + Unpin> Unpin
-    for CompatRead<'a, Io, Buf>
-{
-}
-
-impl<'a, Io: compio_io::AsyncRead + 'a, Buf: IoBufMut> Drop for CompatRead<'a, Io, Buf> {
-    fn drop(&mut self) {
-        if let Some(fut) = self.fut.as_mut() {
-            // safety: we won't use it again
-            unsafe {
-                ManuallyDrop::drop(fut);
-            }
-        }
-    }
-}
-
 impl<'a, Io: compio_io::AsyncRead + 'a, Buf: IoBufMut> AsyncBufRead for CompatRead<'a, Io, Buf> {
     fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
         // safety: we don't move self
@@ -51,7 +34,7 @@ impl<'a, Io: compio_io::AsyncRead + 'a, Buf: IoBufMut> AsyncBufRead for CompatRe
         loop {
             match this.fut.as_mut() {
                 // safety: we won't move it unless fut is completed
-                Some(fut) => match unsafe { Pin::new_unchecked(&mut **fut) }.poll(cx) {
+                Some(fut) => match unsafe { Pin::new_unchecked(fut) }.poll(cx) {
                     Poll::Pending => return Poll::Pending,
 
                     Poll::Ready((io, BufResult(res, buf))) => {
@@ -74,11 +57,11 @@ impl<'a, Io: compio_io::AsyncRead + 'a, Buf: IoBufMut> AsyncBufRead for CompatRe
                     let buf = this.buf.take().unwrap();
                     let mut io = this.io.take().unwrap();
 
-                    this.fut = Some(ManuallyDrop::new(async move {
+                    this.fut = Some(async move {
                         let buf_res = io.read(buf).await;
 
                         (io, buf_res)
-                    }));
+                    });
                 }
             }
         }
@@ -118,6 +101,7 @@ impl<'a, Io: compio_io::AsyncRead + 'a, Buf: IoBufMut> futures_util::AsyncRead
 #[cfg(test)]
 mod tests {
     use std::env;
+    use std::pin::pin;
 
     use compio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
     use compio::runtime;
@@ -141,7 +125,8 @@ mod tests {
             .detach();
 
             let tcp_stream = TcpStream::connect(addr).await.unwrap();
-            let mut compat_read = CompatRead::new(tcp_stream, vec![0; 100]);
+            let compat_read = CompatRead::new(tcp_stream, vec![0; 100]);
+            let mut compat_read = pin!(compat_read);
 
             let mut buf = [0; 100];
             let n = compat_read.read(&mut buf).await.unwrap();
@@ -164,7 +149,8 @@ mod tests {
             .detach();
 
             let unix_stream = UnixStream::connect(path).unwrap();
-            let mut compat_read = CompatRead::new(unix_stream, vec![0; 100]);
+            let compat_read = CompatRead::new(unix_stream, vec![0; 100]);
+            let mut compat_read = pin!(compat_read);
 
             let mut buf = [0; 100];
             let n = compat_read.read(&mut buf).await.unwrap();
