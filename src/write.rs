@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::mem::ManuallyDrop;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::{io, slice};
@@ -17,9 +18,9 @@ type CloseFut<'a, Io: compio_io::AsyncWrite + 'a, Buf: IoBufMut> =
 
 enum FutState<'a, Io: compio_io::AsyncWrite + 'a, Buf: IoBufMut> {
     Idle,
-    Write(WriteFut<'a, Io, Buf>),
-    Flush(FlushFut<'a, Io, Buf>),
-    Close(CloseFut<'a, Io, Buf>),
+    Write(ManuallyDrop<WriteFut<'a, Io, Buf>>),
+    Flush(ManuallyDrop<FlushFut<'a, Io, Buf>>),
+    Close(ManuallyDrop<CloseFut<'a, Io, Buf>>),
 }
 
 pub struct CompatWrite<'a, Io: compio_io::AsyncWrite + 'a, Buf: IoBufMut> {
@@ -29,6 +30,32 @@ pub struct CompatWrite<'a, Io: compio_io::AsyncWrite + 'a, Buf: IoBufMut> {
     flush_waker: AtomicWaker,
     close_waker: AtomicWaker,
     buf: Option<Buf>,
+}
+
+impl<'a, Io: compio_io::AsyncWrite + 'a, Buf: IoBufMut> Drop for CompatWrite<'a, Io, Buf> {
+    fn drop(&mut self) {
+        match &mut self.fut {
+            FutState::Idle => {}
+            FutState::Write(fut) => {
+                // safety: we won't use again
+                unsafe {
+                    ManuallyDrop::drop(fut);
+                }
+            }
+            FutState::Flush(fut) => {
+                // safety: we won't use again
+                unsafe {
+                    ManuallyDrop::drop(fut);
+                }
+            }
+            FutState::Close(fut) => {
+                // safety: we won't use again
+                unsafe {
+                    ManuallyDrop::drop(fut);
+                }
+            }
+        }
+    }
 }
 
 impl<'a, Io: compio_io::AsyncWrite + 'a, Buf: IoBufMut> CompatWrite<'a, Io, Buf> {
@@ -69,20 +96,25 @@ impl<'a, Io: compio_io::AsyncWrite + 'a, Buf: IoBufMut> futures_util::AsyncWrite
                         buf.copy_from_slice(&data[..size]);
                     }
 
-                    this.fut = FutState::Write(async move {
+                    this.fut = FutState::Write(ManuallyDrop::new(async move {
                         let BufResult(res, buf) = io.write(buf).await;
 
                         (io, BufResult(res, buf.into_inner()))
-                    });
+                    }));
                 }
 
                 FutState::Write(fut) => {
                     // safety: we don't move fut until it is completed
-                    return match unsafe { Pin::new_unchecked(fut) }.poll(cx) {
+                    return match unsafe { Pin::new_unchecked(&mut **fut) }.poll(cx) {
                         Poll::Pending => Poll::Pending,
                         Poll::Ready((io, BufResult(res, buf))) => {
                             this.io = Some(io);
                             this.buf = Some(buf);
+
+                            // safety: we won't use again
+                            unsafe {
+                                ManuallyDrop::drop(fut);
+                            }
                             this.fut = FutState::Idle;
 
                             // wait other pending tasks
@@ -117,11 +149,11 @@ impl<'a, Io: compio_io::AsyncWrite + 'a, Buf: IoBufMut> futures_util::AsyncWrite
                 FutState::Idle => {
                     let mut io = this.io.take().unwrap();
 
-                    this.fut = FutState::Flush(async move {
+                    this.fut = FutState::Flush(ManuallyDrop::new(async move {
                         let res = io.flush().await;
 
                         (io, res)
-                    });
+                    }));
                 }
 
                 FutState::Write(_) => {
@@ -132,10 +164,15 @@ impl<'a, Io: compio_io::AsyncWrite + 'a, Buf: IoBufMut> futures_util::AsyncWrite
 
                 FutState::Flush(fut) => {
                     // safety: we don't move fut until it is completed
-                    return match unsafe { Pin::new_unchecked(fut) }.poll(cx) {
+                    return match unsafe { Pin::new_unchecked(&mut **fut) }.poll(cx) {
                         Poll::Pending => Poll::Pending,
                         Poll::Ready((io, res)) => {
                             this.io = Some(io);
+
+                            // safety: we won't use again
+                            unsafe {
+                                ManuallyDrop::drop(fut);
+                            }
                             this.fut = FutState::Idle;
 
                             // wait other pending tasks
@@ -164,11 +201,11 @@ impl<'a, Io: compio_io::AsyncWrite + 'a, Buf: IoBufMut> futures_util::AsyncWrite
                 FutState::Idle => {
                     let mut io = this.io.take().unwrap();
 
-                    this.fut = FutState::Close(async move {
+                    this.fut = FutState::Close(ManuallyDrop::new(async move {
                         let res = io.shutdown().await;
 
                         (io, res)
-                    });
+                    }));
                 }
 
                 FutState::Write(_) => {
@@ -179,10 +216,15 @@ impl<'a, Io: compio_io::AsyncWrite + 'a, Buf: IoBufMut> futures_util::AsyncWrite
 
                 FutState::Close(fut) => {
                     // safety: we don't move fut until it is completed
-                    return match unsafe { Pin::new_unchecked(fut) }.poll(cx) {
+                    return match unsafe { Pin::new_unchecked(&mut **fut) }.poll(cx) {
                         Poll::Pending => Poll::Pending,
                         Poll::Ready((io, res)) => {
                             this.io = Some(io);
+
+                            // safety: we won't use again
+                            unsafe {
+                                ManuallyDrop::drop(fut);
+                            }
                             this.fut = FutState::Idle;
 
                             // wait other pending tasks
