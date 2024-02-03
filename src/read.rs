@@ -40,6 +40,7 @@ impl<'a, Io: compio_io::AsyncRead + Unpin + 'a, Buf: IoBufMut + Unpin> AsyncBufR
                     Poll::Ready((io, BufResult(res, buf))) => {
                         this.io = Some(io);
                         this.buf = Some(buf);
+                        this.fut.take();
 
                         let n = res?;
                         this.data_size = n;
@@ -131,7 +132,7 @@ mod tests {
     }
 
     #[test]
-    fn test_udp_read() {
+    fn test_uds_read() {
         Runtime::new().unwrap().block_on(async {
             let dir = TempDir::new_in(env::temp_dir()).unwrap();
             let path = dir.path().join("test.sock");

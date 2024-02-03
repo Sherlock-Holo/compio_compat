@@ -75,13 +75,13 @@ impl<'a, Io: compio_io::AsyncWrite + Unpin + 'a, Buf: IoBufMut + Unpin> futures_
                     }));
                 }
 
-                FutState::Write(ref mut fut) => {
+                FutState::Write(fut) => {
                     return match Pin::new(fut).poll(cx) {
                         Poll::Pending => Poll::Pending,
-
                         Poll::Ready((io, BufResult(res, buf))) => {
                             this.io = Some(io);
                             this.buf = Some(buf);
+                            this.fut = FutState::Idle;
 
                             // wait other pending tasks
                             this.flush_waker.wake();
@@ -127,17 +127,20 @@ impl<'a, Io: compio_io::AsyncWrite + Unpin + 'a, Buf: IoBufMut + Unpin> futures_
                     return Poll::Pending;
                 }
 
-                FutState::Flush(ref mut fut) => {
+                FutState::Flush(fut) => {
                     return match Pin::new(fut).poll(cx) {
                         Poll::Pending => Poll::Pending,
                         Poll::Ready((io, res)) => {
                             this.io = Some(io);
+                            this.fut = FutState::Idle;
+
+                            // wait other pending tasks
                             this.write_waker.wake();
                             this.close_waker.wake();
 
                             Poll::Ready(res)
                         }
-                    }
+                    };
                 }
 
                 FutState::Close(_) => {
@@ -169,17 +172,20 @@ impl<'a, Io: compio_io::AsyncWrite + Unpin + 'a, Buf: IoBufMut + Unpin> futures_
                     return Poll::Pending;
                 }
 
-                FutState::Close(ref mut fut) => {
+                FutState::Close(fut) => {
                     return match Pin::new(fut).poll(cx) {
                         Poll::Pending => Poll::Pending,
                         Poll::Ready((io, res)) => {
                             this.io = Some(io);
+                            this.fut = FutState::Idle;
+
+                            // wait other pending tasks
                             this.write_waker.wake();
                             this.flush_waker.wake();
 
                             Poll::Ready(res)
                         }
-                    }
+                    };
                 }
 
                 FutState::Flush(_) => {
@@ -199,7 +205,7 @@ mod tests {
     use compio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
     use compio::runtime;
     use compio::runtime::Runtime;
-    use compio_io::AsyncReadExt;
+    use compio_io::AsyncRead;
     use futures_util::AsyncWriteExt;
     use tempfile::TempDir;
 
@@ -211,42 +217,44 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
 
-            runtime::spawn(async move {
+            let task = runtime::spawn(async move {
                 let tcp_stream = listener.accept().await.unwrap().0;
-                let mut compat_write = CompatWrite::new(tcp_stream, vec![0; 100]);
 
-                compat_write.write_all(b"test").await.unwrap();
-            })
-            .detach();
+                CompatWrite::new(tcp_stream, vec![0; 100])
+            });
 
             let mut tcp_stream = TcpStream::connect(addr).await.unwrap();
 
+            let mut compat_write = task.await;
+            compat_write.write_all(b"test").await.unwrap();
+            compat_write.flush().await.unwrap();
+            compat_write.close().await.unwrap();
+
             let buf = vec![0; 4];
-            let (n, buf) = tcp_stream.read_exact(buf).await.unwrap();
+            let (n, buf) = tcp_stream.read(buf).await.unwrap();
 
             assert_eq!(&buf[..n], b"test");
         });
     }
 
     #[test]
-    fn test_udp_read() {
+    fn test_uds_write() {
         Runtime::new().unwrap().block_on(async {
             let dir = TempDir::new_in(env::temp_dir()).unwrap();
             let path = dir.path().join("test.sock");
             let unix_listener = UnixListener::bind(&path).unwrap();
 
-            runtime::spawn(async move {
-                let unix_stream = unix_listener.accept().await.unwrap().0;
-                let mut compat_write = CompatWrite::new(unix_stream, vec![0; 100]);
-
-                compat_write.write_all(b"test").await.unwrap();
-            })
-            .detach();
+            let task = runtime::spawn(async move { unix_listener.accept().await.unwrap().0 });
 
             let mut unix_stream = UnixStream::connect(path).unwrap();
+            let unix_stream2 = task.await;
+            let mut compat_write = CompatWrite::new(unix_stream2, vec![0; 100]);
+            compat_write.write_all(b"test").await.unwrap();
+            compat_write.flush().await.unwrap();
+            compat_write.close().await.unwrap();
 
             let buf = vec![0; 4];
-            let (n, buf) = unix_stream.read_exact(buf).await.unwrap();
+            let (n, buf) = unix_stream.read(buf).await.unwrap();
 
             assert_eq!(&buf[..n], b"test");
         });
