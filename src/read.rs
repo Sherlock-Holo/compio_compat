@@ -1,22 +1,23 @@
 use std::future::Future;
 use std::io;
+use std::mem::ManuallyDrop;
 use std::pin::Pin;
 use std::task::{ready, Context, Poll};
 
 use compio_buf::{BufResult, IoBufMut};
 use futures_util::AsyncBufRead;
 
-type Fut<'a, Io: compio_io::AsyncRead + Unpin + 'a, Buf: IoBufMut + Unpin> =
-    impl Future<Output = (Io, BufResult<usize, Buf>)> + 'a + Unpin;
+type Fut<'a, Io: compio_io::AsyncRead + 'a, Buf: IoBufMut> =
+    impl Future<Output = (Io, BufResult<usize, Buf>)> + 'a;
 
-pub struct CompatRead<'a, Io: compio_io::AsyncRead + Unpin + 'a, Buf: IoBufMut + Unpin> {
+pub struct CompatRead<'a, Io: compio_io::AsyncRead + 'a, Buf: IoBufMut> {
     io: Option<Io>,
-    fut: Option<Fut<'a, Io, Buf>>,
+    fut: Option<ManuallyDrop<Fut<'a, Io, Buf>>>,
     buf: Option<Buf>,
     data_size: usize,
 }
 
-impl<'a, Io: compio_io::AsyncRead + Unpin + 'a, Buf: IoBufMut + Unpin> CompatRead<'a, Io, Buf> {
+impl<'a, Io: compio_io::AsyncRead + 'a, Buf: IoBufMut> CompatRead<'a, Io, Buf> {
     pub fn new(io: Io, buf: Buf) -> Self {
         Self {
             io: Some(io),
@@ -27,19 +28,29 @@ impl<'a, Io: compio_io::AsyncRead + Unpin + 'a, Buf: IoBufMut + Unpin> CompatRea
     }
 }
 
-impl<'a, Io: compio_io::AsyncRead + Unpin + 'a, Buf: IoBufMut + Unpin> AsyncBufRead
+impl<'a, Io: compio_io::AsyncRead + Unpin + 'a, Buf: IoBufMut + Unpin> Unpin
     for CompatRead<'a, Io, Buf>
 {
+}
+
+impl<'a, Io: compio_io::AsyncRead + 'a, Buf: IoBufMut> AsyncBufRead for CompatRead<'a, Io, Buf> {
     fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
-        let this = self.get_mut();
+        // safety: we don't move self
+        let this = unsafe { self.get_unchecked_mut() };
         loop {
             match this.fut.as_mut() {
-                Some(fut) => match Pin::new(fut).poll(cx) {
+                // safety: we won't move it unless fut is completed
+                Some(fut) => match unsafe { Pin::new_unchecked(&mut **fut) }.poll(cx) {
                     Poll::Pending => return Poll::Pending,
 
                     Poll::Ready((io, BufResult(res, buf))) => {
                         this.io = Some(io);
                         this.buf = Some(buf);
+
+                        // safety: we won't use it again
+                        unsafe {
+                            ManuallyDrop::drop(fut);
+                        }
                         this.fut.take();
 
                         let n = res?;
@@ -56,7 +67,7 @@ impl<'a, Io: compio_io::AsyncRead + Unpin + 'a, Buf: IoBufMut + Unpin> AsyncBufR
                     let buf = this.buf.take().unwrap();
                     let mut io = this.io.take().unwrap();
 
-                    this.fut = Some(Box::pin(async move {
+                    this.fut = Some(ManuallyDrop::new(async move {
                         let buf_res = io.read(buf).await;
 
                         (io, buf_res)
@@ -67,11 +78,12 @@ impl<'a, Io: compio_io::AsyncRead + Unpin + 'a, Buf: IoBufMut + Unpin> AsyncBufR
     }
 
     fn consume(self: Pin<&mut Self>, amt: usize) {
-        self.get_mut().data_size -= amt;
+        // safety: we don't move self
+        unsafe { self.get_unchecked_mut() }.data_size -= amt;
     }
 }
 
-impl<'a, Io: compio_io::AsyncRead + Unpin + 'a, Buf: IoBufMut + Unpin> futures_util::AsyncRead
+impl<'a, Io: compio_io::AsyncRead + 'a, Buf: IoBufMut> futures_util::AsyncRead
     for CompatRead<'a, Io, Buf>
 {
     fn poll_read(
