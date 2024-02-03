@@ -6,23 +6,23 @@ use std::{io, slice};
 use compio_buf::{BufResult, IntoInner, IoBuf, IoBufMut};
 use futures_util::task::AtomicWaker;
 
-type WriteFut<'a, Io: compio_io::AsyncWrite + Unpin + 'a, Buf: IoBufMut + Unpin> =
-    impl Future<Output = (Io, BufResult<usize, Buf>)> + 'a + Unpin;
+type WriteFut<'a, Io: compio_io::AsyncWrite + 'a, Buf: IoBufMut> =
+    impl Future<Output = (Io, BufResult<usize, Buf>)> + 'a;
 
-type FlushFut<'a, Io: compio_io::AsyncWrite + Unpin + 'a, Buf: IoBufMut + Unpin> =
-    impl Future<Output = (Io, io::Result<()>)> + 'a + Unpin;
+type FlushFut<'a, Io: compio_io::AsyncWrite + 'a, Buf: IoBufMut> =
+    impl Future<Output = (Io, io::Result<()>)> + 'a;
 
-type CloseFut<'a, Io: compio_io::AsyncWrite + Unpin + 'a, Buf: IoBufMut + Unpin> =
-    impl Future<Output = (Io, io::Result<()>)> + 'a + Unpin;
+type CloseFut<'a, Io: compio_io::AsyncWrite + 'a, Buf: IoBufMut> =
+    impl Future<Output = (Io, io::Result<()>)> + 'a;
 
-enum FutState<'a, Io: compio_io::AsyncWrite + Unpin + 'a, Buf: IoBufMut + Unpin> {
+enum FutState<'a, Io: compio_io::AsyncWrite + 'a, Buf: IoBufMut> {
     Idle,
     Write(WriteFut<'a, Io, Buf>),
     Flush(FlushFut<'a, Io, Buf>),
     Close(CloseFut<'a, Io, Buf>),
 }
 
-pub struct CompatWrite<'a, Io: compio_io::AsyncWrite + Unpin + 'a, Buf: IoBufMut + Unpin> {
+pub struct CompatWrite<'a, Io: compio_io::AsyncWrite + 'a, Buf: IoBufMut> {
     io: Option<Io>,
     fut: FutState<'a, Io, Buf>,
     write_waker: AtomicWaker,
@@ -31,7 +31,7 @@ pub struct CompatWrite<'a, Io: compio_io::AsyncWrite + Unpin + 'a, Buf: IoBufMut
     buf: Option<Buf>,
 }
 
-impl<'a, Io: compio_io::AsyncWrite + Unpin + 'a, Buf: IoBufMut + Unpin> CompatWrite<'a, Io, Buf> {
+impl<'a, Io: compio_io::AsyncWrite + 'a, Buf: IoBufMut> CompatWrite<'a, Io, Buf> {
     pub fn new(io: Io, buf: Buf) -> Self {
         Self {
             io: Some(io),
@@ -44,7 +44,7 @@ impl<'a, Io: compio_io::AsyncWrite + Unpin + 'a, Buf: IoBufMut + Unpin> CompatWr
     }
 }
 
-impl<'a, Io: compio_io::AsyncWrite + Unpin + 'a, Buf: IoBufMut + Unpin> futures_util::AsyncWrite
+impl<'a, Io: compio_io::AsyncWrite + 'a, Buf: IoBufMut> futures_util::AsyncWrite
     for CompatWrite<'a, Io, Buf>
 {
     fn poll_write(
@@ -52,7 +52,8 @@ impl<'a, Io: compio_io::AsyncWrite + Unpin + 'a, Buf: IoBufMut + Unpin> futures_
         cx: &mut Context<'_>,
         data: &[u8],
     ) -> Poll<io::Result<usize>> {
-        let this = self.get_mut();
+        // safety: we don't move self
+        let this = unsafe { self.get_unchecked_mut() };
         loop {
             match &mut this.fut {
                 FutState::Idle => {
@@ -68,15 +69,16 @@ impl<'a, Io: compio_io::AsyncWrite + Unpin + 'a, Buf: IoBufMut + Unpin> futures_
                         buf.copy_from_slice(&data[..size]);
                     }
 
-                    this.fut = FutState::Write(Box::pin(async move {
+                    this.fut = FutState::Write(async move {
                         let BufResult(res, buf) = io.write(buf).await;
 
                         (io, BufResult(res, buf.into_inner()))
-                    }));
+                    });
                 }
 
                 FutState::Write(fut) => {
-                    return match Pin::new(fut).poll(cx) {
+                    // safety: we don't move fut until it is completed
+                    return match unsafe { Pin::new_unchecked(fut) }.poll(cx) {
                         Poll::Pending => Poll::Pending,
                         Poll::Ready((io, BufResult(res, buf))) => {
                             this.io = Some(io);
@@ -108,17 +110,18 @@ impl<'a, Io: compio_io::AsyncWrite + Unpin + 'a, Buf: IoBufMut + Unpin> futures_
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
+        // safety: we don't move self
+        let this = unsafe { self.get_unchecked_mut() };
         loop {
             match &mut this.fut {
                 FutState::Idle => {
                     let mut io = this.io.take().unwrap();
 
-                    this.fut = FutState::Flush(Box::pin(async move {
+                    this.fut = FutState::Flush(async move {
                         let res = io.flush().await;
 
                         (io, res)
-                    }));
+                    });
                 }
 
                 FutState::Write(_) => {
@@ -128,7 +131,8 @@ impl<'a, Io: compio_io::AsyncWrite + Unpin + 'a, Buf: IoBufMut + Unpin> futures_
                 }
 
                 FutState::Flush(fut) => {
-                    return match Pin::new(fut).poll(cx) {
+                    // safety: we don't move fut until it is completed
+                    return match unsafe { Pin::new_unchecked(fut) }.poll(cx) {
                         Poll::Pending => Poll::Pending,
                         Poll::Ready((io, res)) => {
                             this.io = Some(io);
@@ -153,17 +157,18 @@ impl<'a, Io: compio_io::AsyncWrite + Unpin + 'a, Buf: IoBufMut + Unpin> futures_
     }
 
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
+        // safety: we don't move self
+        let this = unsafe { self.get_unchecked_mut() };
         loop {
             match &mut this.fut {
                 FutState::Idle => {
                     let mut io = this.io.take().unwrap();
 
-                    this.fut = FutState::Close(Box::pin(async move {
+                    this.fut = FutState::Close(async move {
                         let res = io.shutdown().await;
 
                         (io, res)
-                    }));
+                    });
                 }
 
                 FutState::Write(_) => {
@@ -173,7 +178,8 @@ impl<'a, Io: compio_io::AsyncWrite + Unpin + 'a, Buf: IoBufMut + Unpin> futures_
                 }
 
                 FutState::Close(fut) => {
-                    return match Pin::new(fut).poll(cx) {
+                    // safety: we don't move fut until it is completed
+                    return match unsafe { Pin::new_unchecked(fut) }.poll(cx) {
                         Poll::Pending => Poll::Pending,
                         Poll::Ready((io, res)) => {
                             this.io = Some(io);
@@ -201,6 +207,7 @@ impl<'a, Io: compio_io::AsyncWrite + Unpin + 'a, Buf: IoBufMut + Unpin> futures_
 #[cfg(test)]
 mod tests {
     use std::env;
+    use std::pin::pin;
 
     use compio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
     use compio::runtime;
@@ -225,7 +232,8 @@ mod tests {
 
             let mut tcp_stream = TcpStream::connect(addr).await.unwrap();
 
-            let mut compat_write = task.await;
+            let compat_write = task.await;
+            let mut compat_write = pin!(compat_write);
             compat_write.write_all(b"test").await.unwrap();
             compat_write.flush().await.unwrap();
             compat_write.close().await.unwrap();
@@ -248,7 +256,8 @@ mod tests {
 
             let mut unix_stream = UnixStream::connect(path).unwrap();
             let unix_stream2 = task.await;
-            let mut compat_write = CompatWrite::new(unix_stream2, vec![0; 100]);
+            let compat_write = CompatWrite::new(unix_stream2, vec![0; 100]);
+            let mut compat_write = pin!(compat_write);
             compat_write.write_all(b"test").await.unwrap();
             compat_write.flush().await.unwrap();
             compat_write.close().await.unwrap();
